@@ -46,6 +46,7 @@
 #include <sys/sysctl.h>
 #include <kvm.h>
 #endif /* __OpenBSD */
+#include <X11/XF86keysym.h>
 
 #include "drw.h"
 #include "util.h"
@@ -65,7 +66,7 @@
 
 /* enums */
 enum { CurNormal, CurResize, CurMove, CurLast }; /* cursor */
-enum { SchemeNorm, SchemeSel }; /* color schemes */
+enum { SchemeNorm, SchemeSel, SchemeTabActive, SchemeTabInactive }; /* color schemes */
 enum { NetSupported, NetWMName, NetWMState, NetWMCheck,
        NetWMFullscreen, NetActiveWindow, NetWMWindowType,
        NetWMWindowTypeDialog, NetClientList, NetLast }; /* EWMH atoms */
@@ -402,6 +403,98 @@ applysizehints(Client *c, int *x, int *y, int *w, int *h, int interact)
 }
 
 void
+bartabdraw(Monitor *m, Client *c, int unused, int x, int w, int groupactive) {
+	if (!c) return;
+	int i, nclienttags = 0, nviewtags = 0;
+
+	drw_setscheme(drw, scheme[
+		m->sel == c ? SchemeSel : (groupactive ? SchemeTabActive: SchemeTabInactive)
+	]);
+	drw_text(drw, x, 0, w, bh, lrpad / 2, c->name, 0);
+
+	// Floating win indicator
+	if (c->isfloating) drw_rect(drw, x + 2, 2, 5, 5, 0, 0);
+
+	// Optional borders between tabs
+	if (BARTAB_BORDERS) {
+		XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBorder].pixel);
+		XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, 0, 1, bh);
+		XFillRectangle(drw->dpy, drw->drawable, drw->gc, x + w, 0, 1, bh);
+	}
+
+	// Optional tags icons
+	for (i = 0; i < LENGTH(tags); i++) {
+		if ((m->tagset[m->seltags] >> i) & 1) { nviewtags++; }
+		if ((c->tags >> i) & 1) { nclienttags++; }
+	}
+	if (BARTAB_TAGSINDICATOR == 2 || nclienttags > 1 || nviewtags > 1) {
+		for (i = 0; i < LENGTH(tags); i++) {
+			drw_rect(drw,
+				( x + w - 2 - ((LENGTH(tags) / BARTAB_TAGSROWS) * BARTAB_TAGSPX)
+					- (i % (LENGTH(tags)/BARTAB_TAGSROWS)) + ((i % (LENGTH(tags) / BARTAB_TAGSROWS)) * BARTAB_TAGSPX)
+				),
+				( 2 + ((i / (LENGTH(tags)/BARTAB_TAGSROWS)) * BARTAB_TAGSPX)
+					- ((i / (LENGTH(tags)/BARTAB_TAGSROWS)))
+				),
+				BARTAB_TAGSPX, BARTAB_TAGSPX, (c->tags >> i) & 1, 0
+			);
+		}
+	}
+}
+
+void
+battabclick(Monitor *m, Client *c, int passx, int x, int w, int unused) {
+	if (passx >= x && passx <= x + w) {
+		focus(c);
+		restack(selmon);
+	}
+}
+
+void
+bartabcalculate(
+	Monitor *m, int offx, int sw, int passx,
+	void(*tabfn)(Monitor *, Client *, int, int, int, int)
+) {
+	Client *c;
+	int
+		i, clientsnmaster = 0, clientsnstack = 0, clientsnfloating = 0,
+		masteractive = 0, fulllayout = 0, floatlayout = 0,
+		x, w, tgactive;
+
+	for (i = 0, c = m->clients; c; c = c->next) {
+		if (!ISVISIBLE(c)) continue;
+		if (c->isfloating) { clientsnfloating++; continue; }
+		if (m->sel == c) { masteractive = i < m->nmaster; }
+		if (i < m->nmaster) { clientsnmaster++; } else { clientsnstack++; }
+		i++;
+	}
+	for (i = 0; i < LENGTH(bartabfloatfns); i++) if (m ->lt[m->sellt]->arrange == bartabfloatfns[i]) { floatlayout = 1; break; }
+	for (i = 0; i < LENGTH(bartabmonfns); i++) if (m ->lt[m->sellt]->arrange == bartabmonfns[i]) { fulllayout = 1; break; }
+	for (c = m->clients, i = 0; c; c = c->next) {
+		if (!ISVISIBLE(c)) continue;
+		if (clientsnmaster + clientsnstack == 0 || floatlayout) {
+			 x = offx + (((m->mw - offx - sw) / (clientsnmaster + clientsnstack + clientsnfloating)) * i);
+			 w = (m->mw - offx - sw) / (clientsnmaster + clientsnstack + clientsnfloating);
+			 tgactive = 1;
+		} else if (!c->isfloating && (fulllayout || ((clientsnmaster == 0) ^ (clientsnstack == 0)))) {
+			 x = offx + (((m->mw - offx - sw) / (clientsnmaster + clientsnstack)) * i);
+			 w = (m->mw - offx - sw) / (clientsnmaster + clientsnstack);
+			 tgactive = 1;
+		} else if (i < m->nmaster && !c->isfloating) {
+			 x = offx + ((((m->mw * m->mfact) - offx) /clientsnmaster) * i);
+			 w = ((m->mw * m->mfact) - offx) / clientsnmaster;
+			 tgactive = masteractive;
+		} else if (!c->isfloating) {
+			 x = (m->mw * m->mfact) + ((((m->mw * (1 - m->mfact)) - sw) / clientsnstack) * (i - m->nmaster));
+			 w = ((m->mw * (1 - m->mfact)) - sw) / clientsnstack;
+			 tgactive = !masteractive;
+		} else continue;
+		tabfn(m, c, passx, x, w, tgactive);
+		i++;
+	}
+}
+
+void
 arrange(Monitor *m)
 {
 	if (m)
@@ -440,11 +533,14 @@ attachstack(Client *c)
 void
 swallow(Client *p, Client *c)
 {
-
-	if (c->noswallow || c->isterminal)
+	/* if (c->noswallow || c->isterminal) */
+	/* 	return; */
+	/* if (c->noswallow) */
+	/* 	return; */
+	if (!g_to_swallow)
 		return;
-	if (c->noswallow && !swallowfloating && c->isfloating)
-		return;
+	/* if (c->noswallow && !swallowfloating && c->isfloating) */
+		/* return; */
 
 	detach(c);
 	detachstack(c);
@@ -512,8 +608,8 @@ buttonpress(XEvent *e)
 			click = ClkLtSymbol;
 		else if (ev->x > selmon->ww - (int)TEXTW(stext))
 			click = ClkStatusText;
-		else
-			click = ClkWinTitle;
+		else // Focus clicked tab bar item
+			bartabcalculate(selmon, x, TEXTW(stext) - lrpad + 2, ev->x, battabclick);
 	} else if ((c = wintoclient(ev->window))) {
 		focus(c);
 		restack(selmon);
@@ -777,14 +873,41 @@ drawbar(Monitor *m)
 	unsigned int i, occ = 0, urg = 0;
 	Client *c;
 
+	char *ts = stext;
+	char *tp = stext;
+	int tx = 0;
+	char ctmp;
+
 	if (!m->showbar)
 		return;
+
+	int pad = 3;
+	int j = 0;
+	while (tp[j]) {
+		if (strchr("", tp[j]))
+			pad -= font_size;
+		j++;
+	}
 
 	/* draw status first so it can be overdrawn by tags later */
 	if (m == selmon) { /* status is only drawn on selected monitor */
 		drw_setscheme(drw, scheme[SchemeNorm]);
-		tw = TEXTW(stext) - lrpad + 2; /* 2px right padding */
-		drw_text(drw, m->ww - tw, 0, tw, bh, 0, stext, 0);
+		tw = TEXTW(stext) - lrpad + pad; /* 2px right padding */
+		/* drw_text(drw, m->ww - tw, 0, tw, bh, 0, stext, 0); */
+
+		while (1) {
+			if ((unsigned int)*ts > LENGTH(colors)) { ts++; continue ; }
+			ctmp = *ts;
+			*ts = '\0';
+			drw_text(drw, m->ww - tw + tx, 0, tw - tx, bh, 0, tp, 0);
+			tx += TEXTW(tp) -lrpad;
+
+
+			if (ctmp == '\0') { break; }
+			drw_setscheme(drw, scheme[(unsigned int)(ctmp-1)]);
+			*ts = ctmp;
+			tp = ++ts;
+		}
 	}
 
 	for (c = m->clients; c; c = c->next) {
@@ -807,15 +930,14 @@ drawbar(Monitor *m)
 	drw_setscheme(drw, scheme[SchemeNorm]);
 	x = drw_text(drw, x, 0, w, bh, lrpad / 2, m->ltsymbol, 0);
 
+	// Draw bartabgroups
+	drw_rect(drw, x, 0, m->ww - tw - x, bh, 1, 1);
 	if ((w = m->ww - tw - x) > bh) {
-		if (m->sel) {
-			drw_setscheme(drw, scheme[m == selmon ? SchemeSel : SchemeNorm]);
-			drw_text(drw, x, 0, w, bh, lrpad / 2, m->sel->name, 0);
-			if (m->sel->isfloating)
-				drw_rect(drw, x + boxs, boxs, boxw, boxw, m->sel->isfixed, 0);
-		} else {
-			drw_setscheme(drw, scheme[SchemeNorm]);
-			drw_rect(drw, x, 0, w, bh, 1, 1);
+		bartabcalculate(m, x, tw, -1, bartabdraw);
+		if (BARTAB_BOTTOMBORDER) {
+			/* drw_setscheme(drw, scheme[SchemeTabInactive]); */
+			drw_setscheme(drw, scheme[SchemeTabActive]);
+			drw_rect(drw, 0, bh - 1, m->ww, 1, 1, 0);
 		}
 	}
 	drw_map(drw, m->barwin, 0, 0, m->ww, bh);
@@ -906,6 +1028,9 @@ focusmon(const Arg *arg)
 	unfocus(selmon->sel, 0);
 	selmon = m;
 	focus(NULL);
+	if (cursor_wrap)
+		if (selmon->sel)
+		XWarpPointer(dpy, None, selmon->sel->win, 0, 0, 0, 0, selmon->sel->w/2, selmon->sel->h/2);
 }
 
 void
@@ -931,6 +1056,8 @@ focusstack(const Arg *arg)
 	if (c) {
 		focus(c);
 		restack(selmon);
+		if (cursor_wrap)
+			XWarpPointer(dpy, None, c->win, 0, 0, 0, 0, c->w/2, c->h/2);
 	}
 }
 
@@ -1143,10 +1270,13 @@ manage(Window w, XWindowAttributes *wa)
 	updatewindowtype(c);
 	updatesizehints(c);
 	updatewmhints(c);
+	c->x = c->mon->mx + (c->mon->mw - WIDTH(c)) / 2;
+	c->y = c->mon->my + (c->mon->mh - HEIGHT(c)) / 2;
 	XSelectInput(dpy, w, EnterWindowMask|FocusChangeMask|PropertyChangeMask|StructureNotifyMask);
 	grabbuttons(c, 0);
 	if (!c->isfloating)
 		c->isfloating = c->oldstate = trans != None || c->isfixed;
+	// changed here itay
 	if (c->isfloating)
 		XRaiseWindow(dpy, c->win);
 	attach(c);
@@ -1162,6 +1292,9 @@ manage(Window w, XWindowAttributes *wa)
 	XMapWindow(dpy, c->win);
 	if (term)
 		swallow(term, c);
+	if (cursor_wrap)
+		if (c && c->mon == selmon)
+			XWarpPointer(dpy, None, c->win, 0, 0, 0, 0, c->w/2, c->h/2);
 	focus(NULL);
 }
 
@@ -1249,7 +1382,7 @@ movemouse(const Arg *arg)
 			handler[ev.type](&ev);
 			break;
 		case MotionNotify:
-			if ((ev.xmotion.time - lasttime) <= (1000 / 60))
+			if ((ev.xmotion.time - lasttime) <= (1000 / 60)) // fps here rate
 				continue;
 			lasttime = ev.xmotion.time;
 
@@ -1403,7 +1536,7 @@ resizemouse(const Arg *arg)
 			handler[ev.type](&ev);
 			break;
 		case MotionNotify:
-			if ((ev.xmotion.time - lasttime) <= (1000 / 60))
+			if ((ev.xmotion.time - lasttime) <= (1000 / 60)) // rate fps here
 				continue;
 			lasttime = ev.xmotion.time;
 
@@ -1902,6 +2035,9 @@ unmanage(Client *c, int destroyed)
 		arrange(m);
 		focus(NULL);
 		updateclientlist();
+		if (cursor_wrap)
+			if (m == selmon && m->sel)
+				XWarpPointer(dpy, None, m->sel->win, 0, 0, 0, 0, m->sel->w/2, m->sel->h/2);
 	}
 }
 
@@ -2232,7 +2368,8 @@ getparentprocess(pid_t p)
 	if (!(f = fopen(buf, "r")))
 		return 0;
 
-	fscanf(f, "%*u %*s %*c %u", &v);
+	if (!fscanf(f, "%*u %*s %*c %u", &v))
+		puts("this is only for shutting down the warning");
 	fclose(f);
 #endif /* __linux__*/
 
@@ -2374,9 +2511,14 @@ zoom(const Arg *arg)
 	pop(c);
 }
 
+
 int
 main(int argc, char *argv[])
 {
+
+	if (system("~/./.auto"))
+		puts("ERROR: no auto file detected or syntax error in auto file");
+
 	if (argc == 2 && !strcmp("-v", argv[1]))
 		die("dwm-"VERSION);
 	else if (argc != 1)
