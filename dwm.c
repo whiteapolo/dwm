@@ -2421,7 +2421,10 @@ void zoom(const Arg *arg)
 
 int main(int argc, char *argv[])
 {
-	if (system("~/./.auto"))
+	// if (system("~/./.auto"))
+	// 	puts("ERROR: no auto file detected or syntax error in auto file");
+
+	if (system("~/.config/dwm/./start_script_dwm"))
 		puts("ERROR: no auto file detected or syntax error in auto file");
 
 	if (argc == 2 && !strcmp("-v", argv[1]))
